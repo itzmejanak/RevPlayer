@@ -271,7 +271,7 @@ function SeekSlider({ thumbnailUrl }: { thumbnailUrl?: string }) {
         step={0.1}
         value={shown}
         onInput={(event) => setScrubValue(Number(event.currentTarget.value))}
-        onChange={commit}
+        onKeyUp={commit}
         className="absolute inset-0 z-10 h-full w-full cursor-pointer opacity-0"
         aria-label="Seek"
       />
@@ -353,7 +353,7 @@ function VolumeControl() {
           step={0.05}
           value={shown}
           onInput={(event) => setScrubValue(Number(event.currentTarget.value))}
-          onChange={commit}
+          onKeyUp={commit}
           className="absolute inset-0 z-10 h-full w-full cursor-pointer opacity-0"
           aria-label="Volume"
         />
