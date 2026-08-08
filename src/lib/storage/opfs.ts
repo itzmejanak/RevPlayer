@@ -2,12 +2,20 @@ import { openDB, type DBSchema, type IDBPDatabase } from "idb";
 
 export const OPFS_DIR = "revplayer-videos";
 
+export interface BlobWriter {
+  write(blob: Blob): Promise<void>;
+  close(): Promise<void>;
+  abort(): Promise<void>;
+}
+
 export interface BlobStore {
   name: "opfs" | "cache" | "idb";
   write(key: string, blob: Blob): Promise<void>;
   read(key: string): Promise<Blob | undefined>;
   delete(key: string): Promise<void>;
   size(key: string): Promise<number | undefined>;
+  createWriter?(key: string, mode: "truncate" | "append"): Promise<BlobWriter>;
+  consolidate?(key: string): Promise<void>;
 }
 
 export function sanitizeKey(key: string): string {
@@ -68,6 +76,31 @@ export function createOpfsStore(): BlobStore {
         return undefined;
       }
     },
+    async createWriter(key, mode) {
+      const dir = await getDir();
+      const handle = await dir.getFileHandle(sanitizeKey(key), {
+        create: true,
+      });
+      const writable =
+        mode === "append"
+          ? await handle.createWritable({ keepExistingData: true })
+          : await handle.createWritable();
+      if (mode === "append") {
+        const file = await handle.getFile();
+        await writable.seek(file.size);
+      }
+      return {
+        async write(blob) {
+          await writable.write(blob);
+        },
+        async close() {
+          await writable.close();
+        },
+        async abort() {
+          await writable.abort();
+        },
+      };
+    },
   };
 }
 
@@ -110,22 +143,46 @@ interface BlobDBSchema extends DBSchema {
     key: string;
     value: { key: string; bytes: ArrayBuffer; type: string; size: number };
   };
+  chunks: {
+    key: string;
+    value: { key: string; videoKey: string; index: number; bytes: ArrayBuffer; size: number };
+    indexes: { "by-key": string };
+  };
 }
 
 const BLOB_DB_NAME = "revplayer-blobs";
-const BLOB_DB_VERSION = 1;
+const BLOB_DB_VERSION = 2;
 
 let blobDbPromise: Promise<IDBPDatabase<BlobDBSchema>> | null = null;
 
 function getBlobDb(): Promise<IDBPDatabase<BlobDBSchema>> {
   if (!blobDbPromise) {
     blobDbPromise = openDB<BlobDBSchema>(BLOB_DB_NAME, BLOB_DB_VERSION, {
-      upgrade(db) {
-        db.createObjectStore("blobs", { keyPath: "key" });
+      upgrade(db, oldVersion) {
+        if (!db.objectStoreNames.contains("blobs")) {
+          db.createObjectStore("blobs", { keyPath: "key" });
+        }
+        if (oldVersion < 2 && !db.objectStoreNames.contains("chunks")) {
+          const chunks = db.createObjectStore("chunks", { keyPath: "key" });
+          chunks.createIndex("by-key", "videoKey");
+        }
       },
     });
   }
   return blobDbPromise;
+}
+
+function chunkKey(key: string, index: number): string {
+  return `${sanitizeKey(key)}__${index}`;
+}
+
+async function getChunkRecords(
+  db: IDBPDatabase<BlobDBSchema>,
+  key: string
+): Promise<Array<BlobDBSchema["chunks"]["value"]>> {
+  const safeKey = sanitizeKey(key);
+  const records = await db.getAllFromIndex("chunks", "by-key", safeKey);
+  return records.sort((a, b) => a.index - b.index);
 }
 
 async function toRecord(key: string, blob: Blob): Promise<BlobDBSchema["blobs"]["value"]> {
@@ -144,17 +201,74 @@ export function createIdbBlobStore(): BlobStore {
       await (await getBlobDb()).put("blobs", await toRecord(key, blob));
     },
     async read(key) {
-      const entry = await (await getBlobDb()).get("blobs", sanitizeKey(key));
-      return entry
-        ? new Blob([entry.bytes], { type: entry.type })
-        : undefined;
+      const db = await getBlobDb();
+      const entry = await db.get("blobs", sanitizeKey(key));
+      if (entry) {
+        return new Blob([entry.bytes], { type: entry.type });
+      }
+      const records = await getChunkRecords(db, key);
+      if (records.length === 0) return undefined;
+      const parts = records.map((record) => record.bytes);
+      return new Blob(parts, { type: "" });
     },
     async delete(key) {
-      await (await getBlobDb()).delete("blobs", sanitizeKey(key));
+      const db = await getBlobDb();
+      await db.delete("blobs", sanitizeKey(key));
+      const records = await getChunkRecords(db, key);
+      await Promise.all(records.map((record) => db.delete("chunks", record.key)));
     },
     async size(key) {
-      const entry = await (await getBlobDb()).get("blobs", sanitizeKey(key));
-      return entry?.size;
+      const db = await getBlobDb();
+      const entry = await db.get("blobs", sanitizeKey(key));
+      if (entry) return entry.size;
+      const records = await getChunkRecords(db, key);
+      if (records.length === 0) return undefined;
+      return records.reduce((sum, record) => sum + record.size, 0);
+    },
+    async createWriter(key, mode) {
+      const db = await getBlobDb();
+      const safeKey = sanitizeKey(key);
+      let index = 0;
+      if (mode === "append") {
+        const records = await getChunkRecords(db, key);
+        if (records.length > 0) {
+          index = records[records.length - 1].index + 1;
+        }
+      } else {
+        const records = await getChunkRecords(db, key);
+        await Promise.all(records.map((record) => db.delete("chunks", record.key)));
+      }
+      return {
+        async write(blob) {
+          await db.put("chunks", {
+            key: chunkKey(safeKey, index),
+            videoKey: safeKey,
+            index,
+            bytes: await blob.arrayBuffer(),
+            size: blob.size,
+          });
+          index += 1;
+        },
+        async close() {
+          // Chunks are persisted per write; nothing to flush.
+        },
+        async abort() {
+          // Keep chunks written so far; callers delete on cancel.
+        },
+      };
+    },
+    async consolidate(key) {
+      const db = await getBlobDb();
+      const records = await getChunkRecords(db, key);
+      if (records.length === 0) return;
+      const blob = new Blob(records.map((record) => record.bytes));
+      await db.put("blobs", {
+        key: sanitizeKey(key),
+        bytes: await blob.arrayBuffer(),
+        type: "",
+        size: blob.size,
+      });
+      await Promise.all(records.map((record) => db.delete("chunks", record.key)));
     },
   };
 }
@@ -165,6 +279,13 @@ export function getBlobStore(): BlobStore {
   }
   if (isCacheStoreSupported()) {
     return createCacheStore();
+  }
+  return createIdbBlobStore();
+}
+
+export function getDownloadBlobStore(): BlobStore {
+  if (isOpfsSupported()) {
+    return createOpfsStore();
   }
   return createIdbBlobStore();
 }

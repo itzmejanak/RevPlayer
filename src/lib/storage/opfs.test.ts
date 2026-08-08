@@ -64,25 +64,44 @@ describe("OPFS store against a mocked directory handle", () => {
   let root: FakeDirHandle;
 
   class FakeWritable {
-    chunks: ArrayBuffer[] = [];
+    file: FakeFileHandle;
+    position = 0;
+
+    constructor(file: FakeFileHandle, keepExisting: boolean) {
+      this.file = file;
+      if (keepExisting) {
+        this.position = file.bytes.byteLength;
+      } else {
+        file.bytes = new Uint8Array();
+      }
+    }
 
     async write(chunk: Blob) {
-      this.chunks.push(await chunk.arrayBuffer());
+      const incoming = new Uint8Array(await chunk.arrayBuffer());
+      const next = new Uint8Array(this.file.bytes.byteLength + incoming.byteLength);
+      next.set(this.file.bytes);
+      next.set(incoming, this.file.bytes.byteLength);
+      this.file.bytes = next;
+    }
+
+    async seek(offset: number) {
+      this.position = offset;
     }
 
     async close() {}
+
+    async abort() {}
   }
 
   class FakeFileHandle {
-    writable = new FakeWritable();
+    bytes = new Uint8Array();
 
-    async createWritable() {
-      this.writable = new FakeWritable();
-      return this.writable;
+    async createWritable(options?: { keepExistingData?: boolean }) {
+      return new FakeWritable(this, options?.keepExistingData === true);
     }
 
     async getFile(): Promise<File> {
-      return new File(this.writable.chunks, "file");
+      return new File([this.bytes], "file");
     }
   }
 
@@ -162,6 +181,91 @@ describe("OPFS store against a mocked directory handle", () => {
     await store.write("clip", new Blob(["x"]));
     await store.delete("clip");
 
+    expect(await store.read("clip")).toBeUndefined();
+    expect(await store.size("clip")).toBeUndefined();
+  });
+
+  it("appends chunks through the incremental writer", async () => {
+    const store = createOpfsStore();
+    const writer = await store.createWriter!("clip", "truncate");
+    await writer.write(new Blob([new Uint8Array([0, 1, 2])]));
+    await writer.write(new Blob([new Uint8Array([3, 4])]));
+    await writer.close();
+
+    expect(await store.size("clip")).toBe(5);
+    const read = await store.read("clip");
+    expect(new Uint8Array(await read!.arrayBuffer())).toEqual(
+      new Uint8Array([0, 1, 2, 3, 4]),
+    );
+  });
+
+  it("resumes an append-mode writer after the existing data", async () => {
+    const store = createOpfsStore();
+    const first = await store.createWriter!("clip", "truncate");
+    await first.write(new Blob([new Uint8Array([0, 1, 2])]));
+    await first.close();
+
+    const second = await store.createWriter!("clip", "append");
+    await second.write(new Blob([new Uint8Array([3, 4])]));
+    await second.close();
+
+    expect(await store.size("clip")).toBe(5);
+    const read = await store.read("clip");
+    expect(new Uint8Array(await read!.arrayBuffer())).toEqual(
+      new Uint8Array([0, 1, 2, 3, 4]),
+    );
+  });
+});
+
+describe("IDB incremental writer", () => {
+  it("writes chunks and reads them back in order", async () => {
+    const store = createIdbBlobStore();
+    const writer = await store.createWriter!("clip", "truncate");
+    await writer.write(new Blob(["hello "], { type: "video/mp4" }));
+    await writer.write(new Blob(["world"]));
+    await writer.close();
+
+    expect(await store.size("clip")).toBe(11);
+    const read = await store.read("clip");
+    expect(await read?.text()).toBe("hello world");
+  });
+
+  it("resumes appending after existing chunks", async () => {
+    const store = createIdbBlobStore();
+    const first = await store.createWriter!("clip", "truncate");
+    await first.write(new Blob(["abc"]));
+    await first.close();
+
+    const second = await store.createWriter!("clip", "append");
+    await second.write(new Blob(["def"]));
+    await second.close();
+
+    expect(await store.read("clip")).toBeDefined();
+    expect(await (await store.read("clip"))!.text()).toBe("abcdef");
+  });
+
+  it("consolidates chunks into a single whole-blob record", async () => {
+    const store = createIdbBlobStore();
+    const writer = await store.createWriter!("clip", "truncate");
+    await writer.write(new Blob(["chunk one "]));
+    await writer.write(new Blob(["chunk two"]));
+    await writer.close();
+
+    expect(await store.size("clip")).toBe(19);
+    await store.consolidate!("clip");
+    expect(await store.size("clip")).toBe(19);
+    expect(await (await store.read("clip"))!.text()).toBe(
+      "chunk one chunk two",
+    );
+  });
+
+  it("delete removes both whole-blob records and chunks", async () => {
+    const store = createIdbBlobStore();
+    const writer = await store.createWriter!("clip", "truncate");
+    await writer.write(new Blob(["data"]));
+    await writer.close();
+
+    await store.delete("clip");
     expect(await store.read("clip")).toBeUndefined();
     expect(await store.size("clip")).toBeUndefined();
   });

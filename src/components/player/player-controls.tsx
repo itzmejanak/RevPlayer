@@ -48,7 +48,12 @@ export function PlayerControls({ title, thumbnailUrl }: PlayerControlsProps) {
         <div className="absolute inset-x-0 top-0 bg-gradient-to-b from-black/60 to-transparent p-3">
           <p className="line-clamp-1 text-sm font-medium text-white drop-shadow-sm">{title}</p>
         </div>
-        <div className="absolute inset-x-0 bottom-0 flex flex-col gap-1 bg-gradient-to-t from-black/70 to-transparent px-3 pb-2 pt-10">
+        <div
+          className={cn(
+            "absolute inset-x-0 bottom-0 flex flex-col gap-1 bg-gradient-to-t from-black/70 to-transparent px-3 pb-2 pt-10",
+            visible && "pointer-events-auto",
+          )}
+        >
           <SeekSlider thumbnailUrl={thumbnailUrl} />
           <div className="flex items-center gap-1.5">
             <PlayPauseButton />

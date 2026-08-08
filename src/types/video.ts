@@ -1,10 +1,22 @@
 export type DownloadStatus =
   | "not-downloaded"
   | "downloading"
+  | "paused"
   | "complete"
   | "failed";
 
 export type SourceKind = "local-file" | "remote-url" | "blob";
+
+export interface DownloadRecord {
+  videoId: string;
+  sourceUrl: string;
+  totalBytes: number;
+  receivedBytes: number;
+  quality?: string;
+  status: DownloadStatus;
+  rangeSupported: boolean;
+  updatedAt: number;
+}
 
 export interface QualityOption {
   id: string;

@@ -1,3 +1,12 @@
+import { Suspense } from "react";
+
+import { DownloadsList } from "@/components/downloads/downloads-list";
+import { StorageMeter } from "@/components/downloads/storage-meter";
+
+export const metadata = {
+  title: "Downloads",
+};
+
 export default function DownloadsPage() {
   return (
     <div className="flex flex-1 flex-col gap-6">
@@ -7,7 +16,10 @@ export default function DownloadsPage() {
           Manage your offline videos and device storage.
         </p>
       </div>
-      <p className="text-sm text-muted-foreground">Nothing downloaded yet.</p>
+      <Suspense fallback={<p className="text-sm text-muted-foreground">Loading…</p>}>
+        <DownloadsList />
+      </Suspense>
+      <StorageMeter />
     </div>
   );
 }
